@@ -41,8 +41,47 @@ class LowRankModulation(nn.Module):
         ).unsqueeze(-3)
         rank_one_tensor = x.unsqueeze(-1).unsqueeze(-1) * rank_one_matrix
 
-        return mixture * rank_one_tensor
+        #return mixture * rank_one_tensor
+        return mixture * (1 + rank_one_tensor * 0.1)
 
+'''class LowRankModulation(nn.Module):
+#class SimpleLowRankModulation(nn.Module):
+    def __init__(self, in_channels, spatial_size: tuple[int, int], hidden_dim: int = 32):
+        super().__init__()
+        self.in_channels = in_channels
+        self.spatial_size = spatial_size
+        
+        self.spatial_average = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # 使用Tanh确保输出在合理范围
+        self.channel_modulator = nn.Sequential(
+            nn.Linear(in_channels, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, in_channels),
+            nn.Tanh()  # 限制在[-1, 1]
+        )
+        
+        self.rank_one_vec_h = nn.Linear(in_channels, spatial_size[0])
+        self.rank_one_vec_w = nn.Linear(in_channels, spatial_size[1])
+
+    def forward(self, cue: torch.Tensor, mixture: torch.Tensor):
+        # 提取特征
+        x = self.spatial_average(cue).flatten(1)
+        
+        # 生成调制因子
+        channel_factors = self.channel_modulator(x)
+        hvec = self.rank_one_vec_h(x)
+        wvec = self.rank_one_vec_w(x)
+        
+        # 生成空间调制矩阵
+        spatial_mod = torch.bmm(hvec.unsqueeze(-1), wvec.unsqueeze(-2))
+        spatial_mod = spatial_mod.unsqueeze(1)  # [B, 1, H, W]
+        
+        # 组合并乘以0.1控制幅度
+        modulation_tensor = channel_factors.unsqueeze(-1).unsqueeze(-1) * spatial_mod * 0.1
+        
+        # 残差连接：X * (1 + M)
+        return mixture * (1 + modulation_tensor)'''
 
 class LowRankPerturbation(nn.Module):
     def __init__(self, in_channels: int, spatial_size: tuple[int, int]):
@@ -581,26 +620,49 @@ class Conv2dEIRNN(nn.Module):
                             self.h_pyr_dims[i], self.output_sizes[i]
                         )
                     )
+
+            
         if modulation:
             self.modulations = nn.ModuleList()
             self.modulations_inter = nn.ModuleList()
-            if modulation_on == "hidden":
-                self.modulations.append(
-                    LowRankModulation(
-                        self.h_pyr_dims[i],
-                        self.input_sizes[i],
+            for i in range(num_layers):
+                if modulation_on == "hidden":
+                    self.modulations.append(
+                        LowRankModulation(
+                            self.h_pyr_dims[i],
+                            self.input_sizes[i],
+                        )
                     )
-                )
-                self.modulations_inter.append(
-                    LowRankModulation(
-                        self.h_inter_dims[i],
-                        self.input_sizes[i],
+                    self.modulations_inter.append(
+                        LowRankModulation(
+                            self.h_inter_dims[i],
+                            self.input_sizes[i],
+                        )
                     )
-                )
-            else:
-                self.modulations.append(
-                    LowRankModulation(self.h_pyr_dims[i], self.output_sizes[i])
-                )
+                else:
+                    self.modulations.append(
+                        LowRankModulation(self.h_pyr_dims[i], self.output_sizes[i])
+                    )
+                    
+                    '''# modulation_on == "layer_output"：调制层输出
+                    # 关键：空间大小是 output_sizes[i]
+                    spatial_size = self.output_sizes[i]
+                    
+                    # 计算 hidden_dim
+                    pyr_hidden_dim = max(16, self.h_pyr_dims[i] // 2)
+                    
+                    # 只调制 pyramidal 输出（interneurons 没有直接输出）
+                    self.modulations.append(
+                        LowRankModulation(
+                            in_channels=self.h_pyr_dims[i],
+                            spatial_size=spatial_size,  # 使用 output_sizes
+                            hidden_dim=pyr_hidden_dim
+                        )
+                    )
+                    
+                    # layer_output 模式下不调制 interneurons
+                    self.modulations_inter.append(None)
+'''
 
         self.out_layer = (
             nn.Sequential(
@@ -768,24 +830,25 @@ class Conv2dEIRNN(nn.Module):
                         if self.modulation_on == "hidden":
                             h_pyr_cue = h_pyrs_cue[t][i]
                             h_inter_cue = h_inters_cue[t][i]
-                            h_pyrs[t][i] = self.modulations[t][i](
-                                h_pyr_cue, h_pyrs[t]
+                            h_pyrs[t][i] = self.modulations[i](
+                                h_pyr_cue, h_pyrs[t][i]
                             )
-                            h_inters[t][i] = self.modulations_inter[t][i](
-                                h_inter_cue, h_inters[t]
+                            h_inters[t][i] = self.modulations_inter[i](
+                                h_inter_cue, h_inters[t][i]
                             )
                         else:
                             out_cue = outs_cue[t][i]
-                            outs[t][i] = self.modulations[t][i](
+                            outs[t][i] = self.modulations[i](
                                 out_cue, outs[t][i]
                             )
 
                     # Apply feedback
                     if self.fb_adjacency is not None:
                         for j in self.fb_adjacency[i]:
-                            fbs[j] += self.fb_convs[f"fb_conv_{i}_{j}"](
-                                outs[t][i]
-                            )
+                            if fbs[t][j] is None:
+                                fbs[t][j] = self.fb_convs[f"fb_conv_{i}_{j}"](outs[t][i])
+                            else:
+                                fbs[t][j] += self.fb_convs[f"fb_conv_{i}_{j}"](outs[t][i])
 
             if self.pertubation and stimulation is cue:
                 pertubations_pyr = [0] * len(self.layers)
